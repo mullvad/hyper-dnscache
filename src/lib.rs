@@ -4,24 +4,37 @@ use futures::{
     Async, Future, Poll, Sink, Stream,
 };
 use hyper::client::connect::dns::{Name, Resolve};
-use std::{collections::HashMap, io, net::IpAddr, path::PathBuf, time::Duration, vec};
-use tokio_timer::Timeout;
+use std::{
+    collections::HashMap,
+    io,
+    net::IpAddr,
+    path::PathBuf,
+    time::{Duration, Instant},
+    vec,
+};
 
 // TODO:
 // * Read cache on creation
-// * Optional timeout support
 // * Writing cache to disk on each change
 // * Optional filtering of results from underlying resolver
-// * Cache max age
+
+mod timeout;
+use self::timeout::OptionalTimeout;
 
 pub type CachedAddrs = vec::IntoIter<IpAddr>;
 
-type Cache = HashMap<String, Vec<IpAddr>>;
+type Cache = HashMap<String, CacheEntry>;
+
+struct CacheEntry {
+    addrs: Vec<IpAddr>,
+    timestamp: Option<Instant>,
+}
 
 pub struct CachedResolverBuilder<R: Resolve> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: Option<Cache>,
+    cache_expiry: Option<Duration>,
     cache_file: Option<PathBuf>,
 }
 
@@ -31,6 +44,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
             resolver,
             resolver_timeout: None,
             cache: None,
+            cache_expiry: None,
             cache_file: None,
         }
     }
@@ -40,8 +54,23 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         self
     }
 
-    pub fn cache(mut self, cache: Cache) -> Self {
-        self.cache = Some(cache);
+    pub fn cache(mut self, cache: HashMap<String, Vec<IpAddr>>) -> Self {
+        let mut timestamped_cache = HashMap::with_capacity(cache.len());
+        for (name, addrs) in cache {
+            timestamped_cache.insert(
+                name,
+                CacheEntry {
+                    addrs,
+                    timestamp: None,
+                },
+            );
+        }
+        self.cache = Some(timestamped_cache);
+        self
+    }
+
+    pub fn cache_expiry(mut self, expiry: Duration) -> Self {
+        self.cache_expiry = Some(expiry);
         self
     }
 
@@ -56,6 +85,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
             resolver: self.resolver,
             resolver_timeout: self.resolver_timeout,
             cache: self.cache.unwrap_or_default(),
+            cache_expiry: self.cache_expiry,
             _cache_file: self.cache_file,
             handles_rx: handles_rx.fuse(),
             ongoing_resolutions: HashMap::new(),
@@ -71,9 +101,16 @@ pub struct CachedResolver<R: Resolve> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: Cache,
+    cache_expiry: Option<Duration>,
     _cache_file: Option<PathBuf>,
     handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<CachedAddrs>)>>,
-    ongoing_resolutions: HashMap<String, (R::Future, Vec<oneshot::Sender<CachedAddrs>>)>,
+    ongoing_resolutions: HashMap<
+        String,
+        (
+            OptionalTimeout<R::Future>,
+            Vec<oneshot::Sender<CachedAddrs>>,
+        ),
+    >,
 }
 
 impl<R: Resolve> CachedResolver<R> {
@@ -97,13 +134,13 @@ impl<R: Resolve> CachedResolver<R> {
                 }
                 // Incoming resolve request from a handle
                 Ok(Async::Ready(Some((name, listener)))) => {
-                    if let Some(addrs) = self.cache.get(name.as_str()) {
+                    if let Some(addrs) = self.get_cache_entry(&name) {
                         log::debug!(
                             "Replying from cache for \"{}\" with {:?}",
                             name.as_str(),
                             addrs
                         );
-                        let _ = listener.send(addrs.clone().into_iter());
+                        let _ = listener.send(addrs);
                     } else if let Some((_fut, listeners)) =
                         self.ongoing_resolutions.get_mut(name.as_str())
                     {
@@ -113,12 +150,7 @@ impl<R: Resolve> CachedResolver<R> {
                         );
                         listeners.push(listener);
                     } else {
-                        let name_str = name.as_str().to_string();
-                        log::debug!("Resolving \"{}\"", name_str);
-                        let resolve_future = self.resolver.resolve(name);
-                        let listeners = vec![listener];
-                        self.ongoing_resolutions
-                            .insert(name_str, (resolve_future, listeners));
+                        self.resolve(name, listener);
                     }
                 }
                 // Channels should not error
@@ -131,6 +163,40 @@ impl<R: Resolve> CachedResolver<R> {
         Async::NotReady
     }
 
+    /// Returns the addresses for a name if it exists in the cache and the cache entry is not too
+    /// old.
+    fn get_cache_entry(&self, name: &Name) -> Option<CachedAddrs> {
+        if let Some(cache_entry) = self.cache.get(name.as_str()) {
+            let cache_is_valid = match (self.cache_expiry, cache_entry.timestamp) {
+                // Our cache does not have an expiry, always valid.
+                (None, _) => true,
+                // Cache can expire, current entry has no timestamp, outdated.
+                (Some(_), None) => false,
+                // Cache can expire, current entry has timestamp, compare.
+                (Some(cache_expiry), Some(cache_timestamp)) => {
+                    cache_timestamp.elapsed() < cache_expiry
+                }
+            };
+            if cache_is_valid {
+                Some(cache_entry.addrs.clone().into_iter())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn resolve(&mut self, name: Name, listener: oneshot::Sender<CachedAddrs>) {
+        let name_str = name.as_str().to_string();
+        log::debug!("Resolving \"{}\"", name_str);
+        let resolve_future =
+            OptionalTimeout::new(self.resolver.resolve(name), self.resolver_timeout);
+        let listeners = vec![listener];
+        self.ongoing_resolutions
+            .insert(name_str, (resolve_future, listeners));
+    }
+
     fn poll_ongoing_resolutions(&mut self) -> Async<()> {
         // Process all ongoing DNS resolutions
         let mut finished_resolutions = Vec::new();
@@ -138,7 +204,11 @@ impl<R: Resolve> CachedResolver<R> {
             match resolve_future.poll() {
                 Ok(Async::NotReady) => (),
                 Ok(Async::Ready(addrs_iter)) => {
-                    self.cache.insert(name.clone(), addrs_iter.collect());
+                    let cache_entry = CacheEntry {
+                        addrs: addrs_iter.collect(),
+                        timestamp: Some(Instant::now()),
+                    };
+                    self.cache.insert(name.clone(), cache_entry);
                     finished_resolutions.push(name.clone());
                 }
                 Err(error) => {
@@ -149,7 +219,12 @@ impl<R: Resolve> CachedResolver<R> {
         }
         for name in finished_resolutions {
             let (_resolve_future, listeners) = self.ongoing_resolutions.remove(&name).unwrap();
-            let addrs = self.cache.get(name.as_str()).cloned().unwrap_or_default();
+            let addrs = self
+                .cache
+                .get(name.as_str())
+                .map(|entry| &entry.addrs)
+                .cloned()
+                .unwrap_or_default();
             log::debug!("Replying for \"{}\" with {:?}", name, addrs);
             for listener in listeners {
                 let _ = listener.send(addrs.clone().into_iter());
@@ -221,18 +296,35 @@ mod tests {
     use std::{
         mem,
         net::{Ipv4Addr, Ipv6Addr},
+        sync::mpsc,
+        thread,
         time::Duration,
     };
     use tokio::prelude::FutureExt;
 
-    struct MockResolver(HashMap<String, Vec<IpAddr>>);
+    struct MockResolver {
+        cache: HashMap<String, Vec<IpAddr>>,
+        requests: mpsc::Sender<String>,
+    }
+
+    impl MockResolver {
+        pub fn new(cache: HashMap<String, Vec<IpAddr>>) -> (Self, mpsc::Receiver<String>) {
+            let (tx, rx) = mpsc::channel();
+            let resolver = Self {
+                cache,
+                requests: tx,
+            };
+            (resolver, rx)
+        }
+    }
 
     impl Resolve for MockResolver {
         type Addrs = CachedAddrs;
         type Future = future::FutureResult<Self::Addrs, io::Error>;
         fn resolve(&self, name: Name) -> Self::Future {
             log::debug!("Mock resolving {}", name.as_str());
-            if let Some(addrs) = self.0.get(name.as_str()) {
+            let _ = self.requests.send(name.as_str().to_owned());
+            if let Some(addrs) = self.cache.get(name.as_str()) {
                 future::ok(addrs.clone().into_iter())
             } else {
                 future::err(io::Error::new(io::ErrorKind::Other, "fail"))
@@ -254,7 +346,7 @@ mod tests {
 
     #[test]
     fn no_cache_failing_resolver() {
-        let resolver = MockResolver(HashMap::new());
+        let (resolver, _) = MockResolver::new(HashMap::new());
         let (cached_resolver, handle) = CachedResolver::builder(resolver).build();
 
         let mut runtime = tokio::runtime::Runtime::new().unwrap();
@@ -278,7 +370,7 @@ mod tests {
             "website.com".to_string(),
             vec![Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()],
         );
-        let resolver = MockResolver(HashMap::new());
+        let (resolver, _) = MockResolver::new(HashMap::new());
 
         let (cached_resolver, handle) = CachedResolver::builder(resolver).cache(cache).build();
 
@@ -317,7 +409,7 @@ mod tests {
             "example.com".to_string(),
             vec![Ipv4Addr::new(10, 9, 8, 7).into()],
         );
-        let resolver = MockResolver(domains);
+        let (resolver, _) = MockResolver::new(domains);
 
         let (cached_resolver, handle) = CachedResolver::builder(resolver).build();
 
@@ -338,7 +430,7 @@ mod tests {
             "cached.net".to_string(),
             vec![Ipv4Addr::new(10, 9, 8, 7).into()],
         );
-        let resolver = MockResolver(resolver_domains);
+        let (resolver, _) = MockResolver::new(resolver_domains);
         let mut cache = HashMap::new();
         cache.insert("cached.net".to_string(), vec![Ipv6Addr::LOCALHOST.into()]);
 
@@ -394,7 +486,6 @@ mod tests {
         let expected: &[IpAddr] = &[Ipv4Addr::new(7, 6, 5, 4).into()];
         assert_eq!(result.as_slice(), expected);
 
-
         let time_limited_future = handle
             .resolve(name("some.not.cached.domain.org"))
             .timeout(Duration::from_millis(1000));
@@ -402,6 +493,55 @@ mod tests {
         let result = runtime.block_on(time_limited_future).unwrap();
         let expected: &[IpAddr] = &[];
         assert_eq!(result.as_slice(), expected);
+    }
+
+    #[test]
+    fn cache_expiry_causes_resolve() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "a.cached.domain.it".to_string(),
+            vec![Ipv4Addr::new(7, 6, 5, 4).into()],
+        );
+        let mut resolver_domains = HashMap::new();
+        resolver_domains.insert(
+            "a.cached.domain.it".to_string(),
+            vec![Ipv4Addr::new(100, 1, 2, 3).into()],
+        );
+        let (resolver, mock_rx) = MockResolver::new(resolver_domains);
+
+        let (cached_resolver, handle) = CachedResolver::builder(resolver)
+            .cache(cache)
+            .cache_expiry(Duration::from_millis(100))
+            .build();
+
+        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn(cached_resolver);
+
+        // Cache should always be treated as expired from the start
+        let result = runtime
+            .block_on(handle.resolve(name("a.cached.domain.it")))
+            .unwrap();
+        let expected: &[IpAddr] = &[Ipv4Addr::new(100, 1, 2, 3).into()];
+        assert_eq!(result.as_slice(), expected);
+        assert_eq!(mock_rx.try_recv(), Ok("a.cached.domain.it".to_string()));
+        assert!(mock_rx.try_recv().is_err());
+
+        // Now the cache should be valid, and not cause a resolve
+        let result = runtime
+            .block_on(handle.resolve(name("a.cached.domain.it")))
+            .unwrap();
+        assert_eq!(result.as_slice(), expected);
+        assert!(mock_rx.try_recv().is_err());
+
+        thread::sleep(Duration::from_secs(1));
+
+        // Now the cache should have expired again, triggering a resolve
+        let result = runtime
+            .block_on(handle.resolve(name("a.cached.domain.it")))
+            .unwrap();
+        assert_eq!(result.as_slice(), expected);
+        assert_eq!(mock_rx.try_recv(), Ok("a.cached.domain.it".to_string()));
+        assert!(mock_rx.try_recv().is_err());
     }
 
     /// Hack for converting a string into a hyper compatible `Name`
