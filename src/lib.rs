@@ -4,7 +4,8 @@ use futures::{
     Async, Future, Poll, Sink, Stream,
 };
 use hyper::client::connect::dns::{Name, Resolve};
-use std::{collections::HashMap, io, net::IpAddr, path::PathBuf, vec};
+use std::{collections::HashMap, io, net::IpAddr, path::PathBuf, time::Duration, vec};
+use tokio_timer::Timeout;
 
 // TODO:
 // * Read cache on creation
@@ -19,6 +20,7 @@ type Cache = HashMap<String, Vec<IpAddr>>;
 
 pub struct CachedResolverBuilder<R: Resolve> {
     resolver: R,
+    resolver_timeout: Option<Duration>,
     cache: Option<Cache>,
     cache_file: Option<PathBuf>,
 }
@@ -27,9 +29,15 @@ impl<R: Resolve> CachedResolverBuilder<R> {
     pub fn new(resolver: R) -> Self {
         Self {
             resolver,
+            resolver_timeout: None,
             cache: None,
             cache_file: None,
         }
+    }
+
+    pub fn timeout(mut self, resolver_timeout: Duration) -> Self {
+        self.resolver_timeout = Some(resolver_timeout);
+        self
     }
 
     pub fn cache(mut self, cache: Cache) -> Self {
@@ -46,6 +54,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         let (handles_tx, handles_rx) = mpsc::channel(0);
         let cached_resolver = CachedResolver {
             resolver: self.resolver,
+            resolver_timeout: self.resolver_timeout,
             cache: self.cache.unwrap_or_default(),
             _cache_file: self.cache_file,
             handles_rx: handles_rx.fuse(),
@@ -60,6 +69,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
 
 pub struct CachedResolver<R: Resolve> {
     resolver: R,
+    resolver_timeout: Option<Duration>,
     cache: Cache,
     _cache_file: Option<PathBuf>,
     handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<CachedAddrs>)>>,
@@ -211,7 +221,9 @@ mod tests {
     use std::{
         mem,
         net::{Ipv4Addr, Ipv6Addr},
+        time::Duration,
     };
+    use tokio::prelude::FutureExt;
 
     struct MockResolver(HashMap<String, Vec<IpAddr>>);
 
@@ -225,6 +237,18 @@ mod tests {
             } else {
                 future::err(io::Error::new(io::ErrorKind::Other, "fail"))
             }
+        }
+    }
+
+    // A test resolver that never replies.
+    struct SlowMockResolver;
+
+    impl Resolve for SlowMockResolver {
+        type Addrs = CachedAddrs;
+        type Future = future::Empty<Self::Addrs, io::Error>;
+        fn resolve(&self, name: Name) -> Self::Future {
+            log::debug!("Mock resolving {} (will never reply)", name.as_str());
+            future::empty()
         }
     }
 
@@ -330,6 +354,57 @@ mod tests {
         assert_eq!(result.as_slice(), expected);
     }
 
+    #[test]
+    fn timeout_slow_resolver() {
+        let (cached_resolver, handle) = CachedResolver::builder(SlowMockResolver)
+            .timeout(Duration::from_millis(1000))
+            .build();
+
+        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn(cached_resolver);
+
+        let time_limited_future = handle
+            .resolve(name("some.domain.org"))
+            .timeout(Duration::from_millis(100));
+
+        runtime.block_on(time_limited_future).unwrap_err();
+    }
+
+    #[test]
+    fn slow_resolver_uses_cache_or_empty_result() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "a.cached.domain.it".to_string(),
+            vec![Ipv4Addr::new(7, 6, 5, 4).into()],
+        );
+
+        let (cached_resolver, handle) = CachedResolver::builder(SlowMockResolver)
+            .timeout(Duration::from_millis(100))
+            .cache(cache)
+            .build();
+
+        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn(cached_resolver);
+
+        let time_limited_future = handle
+            .resolve(name("a.cached.domain.it"))
+            .timeout(Duration::from_millis(1000));
+
+        let result = runtime.block_on(time_limited_future).unwrap();
+        let expected: &[IpAddr] = &[Ipv4Addr::new(7, 6, 5, 4).into()];
+        assert_eq!(result.as_slice(), expected);
+
+
+        let time_limited_future = handle
+            .resolve(name("some.not.cached.domain.org"))
+            .timeout(Duration::from_millis(1000));
+
+        let result = runtime.block_on(time_limited_future).unwrap();
+        let expected: &[IpAddr] = &[];
+        assert_eq!(result.as_slice(), expected);
+    }
+
+    /// Hack for converting a string into a hyper compatible `Name`
     fn name(name: &str) -> Name {
         let name = name.to_string();
         unsafe { mem::transmute(name) }
