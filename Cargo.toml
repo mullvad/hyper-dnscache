@@ -13,7 +13,7 @@ license = "MIT/Apache-2.0"
 edition = "2018"
 
 [dependencies]
-hyper = "0.12.18"
+hyper = "0.12.21"
 futures = "0.1.25"
 tokio-fs = "0.1.4"
 log = "0.4.6"
