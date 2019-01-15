@@ -37,7 +37,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         self
     }
 
-    pub fn cache_file<P: Into<PathBuf>>(mut self, cache_file: P) -> Self {
+    pub fn cache_file(mut self, cache_file: impl Into<PathBuf>) -> Self {
         self.cache_file = Some(cache_file.into());
         self
     }
