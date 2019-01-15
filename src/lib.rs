@@ -10,7 +10,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     time::{Duration, Instant},
-    vec,
+    vec::IntoIter,
 };
 
 // TODO:
@@ -21,12 +21,14 @@ use std::{
 mod timeout;
 use self::timeout::OptionalTimeout;
 
-pub type CachedAddrs = vec::IntoIter<IpAddr>;
 
 type Cache = HashMap<String, CacheEntry>;
 
 struct CacheEntry {
+    /// The IPs for this domain.
     addrs: Vec<IpAddr>,
+    /// The time when these addresses were last updated.
+    /// `None` for entries that were never resolved, but remain at their initial values.
     timestamp: Option<Instant>,
 }
 
@@ -103,12 +105,12 @@ pub struct CachedResolver<R: Resolve> {
     cache: Cache,
     cache_expiry: Option<Duration>,
     _cache_file: Option<PathBuf>,
-    handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<CachedAddrs>)>>,
+    handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<IntoIter<IpAddr>>)>>,
     ongoing_resolutions: HashMap<
         String,
         (
             OptionalTimeout<R::Future>,
-            Vec<oneshot::Sender<CachedAddrs>>,
+            Vec<oneshot::Sender<IntoIter<IpAddr>>>,
         ),
     >,
 }
@@ -165,7 +167,7 @@ impl<R: Resolve> CachedResolver<R> {
 
     /// Returns the addresses for a name if it exists in the cache and the cache entry is not too
     /// old.
-    fn get_cache_entry(&self, name: &Name) -> Option<CachedAddrs> {
+    fn get_cache_entry(&self, name: &Name) -> Option<IntoIter<IpAddr>> {
         if let Some(cache_entry) = self.cache.get(name.as_str()) {
             let cache_is_valid = match (self.cache_expiry, cache_entry.timestamp) {
                 // Our cache does not have an expiry, always valid.
@@ -187,7 +189,7 @@ impl<R: Resolve> CachedResolver<R> {
         }
     }
 
-    fn resolve(&mut self, name: Name, listener: oneshot::Sender<CachedAddrs>) {
+    fn resolve(&mut self, name: Name, listener: oneshot::Sender<IntoIter<IpAddr>>) {
         let name_str = name.as_str().to_string();
         log::debug!("Resolving \"{}\"", name_str);
         let resolve_future =
@@ -255,16 +257,16 @@ impl<R: Resolve> Future for CachedResolver<R> {
     }
 }
 
-/// A handle to a `CachedResolver`. This type implements the hyper `Resolve` trait and can be used
+/// A handle to a [`CachedResolver`]. This type implements the hyper `Resolve` trait and can be used
 /// as the resolver on a hyper `HttpConnector`.
-/// Cloning this returns a new handle backed by the same caching `CachedResolver`.
+/// Cloning this returns a new handle backed by the same caching [`CachedResolver`].
 #[derive(Clone)]
 pub struct ResolverHandle {
-    resolver: mpsc::Sender<(Name, oneshot::Sender<CachedAddrs>)>,
+    resolver: mpsc::Sender<(Name, oneshot::Sender<IntoIter<IpAddr>>)>,
 }
 
 impl Resolve for ResolverHandle {
-    type Addrs = CachedAddrs;
+    type Addrs = IntoIter<IpAddr>;
     type Future = Box<dyn Future<Item = Self::Addrs, Error = io::Error> + Send + 'static>;
 
     fn resolve(&self, name: Name) -> Self::Future {
@@ -319,7 +321,7 @@ mod tests {
     }
 
     impl Resolve for MockResolver {
-        type Addrs = CachedAddrs;
+        type Addrs = IntoIter<IpAddr>;
         type Future = future::FutureResult<Self::Addrs, io::Error>;
         fn resolve(&self, name: Name) -> Self::Future {
             log::debug!("Mock resolving {}", name.as_str());
@@ -336,7 +338,7 @@ mod tests {
     struct SlowMockResolver;
 
     impl Resolve for SlowMockResolver {
-        type Addrs = CachedAddrs;
+        type Addrs = IntoIter<IpAddr>;
         type Future = future::Empty<Self::Addrs, io::Error>;
         fn resolve(&self, name: Name) -> Self::Future {
             log::debug!("Mock resolving {} (will never reply)", name.as_str());
