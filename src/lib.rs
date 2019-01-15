@@ -168,22 +168,19 @@ impl<R: Resolve> CachedResolver<R> {
     /// Returns the addresses for a name if it exists in the cache and the cache entry is not too
     /// old.
     fn get_cache_entry(&self, name: &Name) -> Option<IntoIter<IpAddr>> {
-        if let Some(cache_entry) = self.cache.get(name.as_str()) {
-            let cache_is_valid = match (self.cache_expiry, cache_entry.timestamp) {
-                // Our cache does not have an expiry, always valid.
-                (None, _) => true,
-                // Cache can expire, current entry has no timestamp, outdated.
-                (Some(_), None) => false,
-                // Cache can expire, current entry has timestamp, compare.
-                (Some(cache_expiry), Some(cache_timestamp)) => {
-                    cache_timestamp.elapsed() < cache_expiry
-                }
-            };
-            if cache_is_valid {
-                Some(cache_entry.addrs.clone().into_iter())
-            } else {
-                None
+        let cache_entry = self.cache.get(name.as_str())?;
+        let cache_is_valid = match (self.cache_expiry, cache_entry.timestamp) {
+            // Our cache does not have an expiry, always valid.
+            (None, _) => true,
+            // Cache can expire, current entry has no timestamp, outdated.
+            (Some(_), None) => false,
+            // Cache can expire, current entry has timestamp, compare.
+            (Some(cache_expiry), Some(cache_timestamp)) => {
+                cache_timestamp.elapsed() < cache_expiry
             }
+        };
+        if cache_is_valid {
+            Some(cache_entry.addrs.clone().into_iter())
         } else {
             None
         }
