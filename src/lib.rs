@@ -30,9 +30,7 @@ struct CacheEntry {
     timestamp: Option<Instant>,
 }
 
-/// Builder for [`CachedResolver`]s.
-///
-/// [`CachedResolver`]: struct.CachedResolver.html
+/// Builder for [`CachedResolver`].
 pub struct CachedResolverBuilder<R: Resolve> {
     resolver: R,
     resolver_timeout: Option<Duration>,
@@ -42,6 +40,8 @@ pub struct CachedResolverBuilder<R: Resolve> {
 }
 
 impl<R: Resolve> CachedResolverBuilder<R> {
+    /// Returns a new builder that will build a [`CachedResolver`] using `resolver` as the
+    /// underlying DNS resolver.
     pub fn new(resolver: R) -> Self {
         Self {
             resolver,
@@ -52,11 +52,15 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         }
     }
 
+    /// Sets a timeout that will be used to time out requests to the underlying resolver.
+    /// By default there is no timeout. So lookups using the underlying resolver will continue
+    /// until they complete or return an error.
     pub fn timeout(mut self, resolver_timeout: Duration) -> Self {
         self.resolver_timeout = Some(resolver_timeout);
         self
     }
 
+    /// Sets an initial fallback cache. This cache will bootstrap the cached resolver.
     pub fn cache(mut self, cache: HashMap<Name, Vec<IpAddr>>) -> Self {
         let mut timestamped_cache = HashMap::with_capacity(cache.len());
         for (name, addrs) in cache {
@@ -72,6 +76,14 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         self
     }
 
+    /// Sets how old a cache entry has to be before the [`CachedResolver`] tries to use the
+    /// underlying resolver to update the entry.
+    ///
+    /// Note that if setting this at all, any entries given to [`cache`] are considered
+    /// immediately expired.
+    ///
+    /// Even expired cache entries are returned from this resolver if doing a lookup using
+    /// the underlying resolver fails or times out.
     pub fn cache_expiry(mut self, expiry: Duration) -> Self {
         self.cache_expiry = Some(expiry);
         self
@@ -82,6 +94,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         self
     }
 
+    /// Constructs the [`CachedResolver`] and the corresponding [`ResolverHandle`].
     pub fn build(self) -> (CachedResolver<R>, ResolverHandle) {
         let (handles_tx, handles_rx) = mpsc::channel(0);
         let cached_resolver = CachedResolver {
@@ -247,6 +260,8 @@ impl<R: Resolve> Future for CachedResolver<R> {
 /// A handle to a [`CachedResolver`]. This type implements the hyper `Resolve` trait and can be used
 /// as the resolver on a hyper `HttpConnector`.
 /// Cloning this returns a new handle backed by the same caching [`CachedResolver`].
+///
+/// These handles will only work as long as their backing [`CachedResolver`] is running.
 #[derive(Clone)]
 pub struct ResolverHandle {
     resolver: mpsc::Sender<(Name, oneshot::Sender<IntoIter<IpAddr>>)>,
