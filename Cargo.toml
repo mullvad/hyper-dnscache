@@ -17,6 +17,7 @@ hyper = "0.12.18"
 futures = "0.1.25"
 tokio-fs = "0.1.4"
 log = "0.4.6"
+tokio-timer = "0.2.8"
 
 [dev-dependencies]
 tokio = "0.1"
