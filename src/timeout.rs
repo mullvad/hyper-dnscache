@@ -15,9 +15,10 @@ pub enum OptionalTimeout<F: Future> {
 }
 
 impl<F: Future> OptionalTimeout<F> {
-    /// Create a new `OptionalTimeout` future.
+    /// Creates a new `OptionalTimeout` future.
     ///
-    /// The duration parameter may be `None` to indicate there is no time limit.
+    /// The duration parameter may be `None` to indicate there is no time limit. This means that
+    /// `future` will run as normal.
     pub fn new(future: F, timeout: Option<Duration>) -> Self {
         match timeout {
             Some(timeout) => OptionalTimeout::Limited(Timeout::new(future, timeout)),
