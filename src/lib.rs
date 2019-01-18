@@ -53,7 +53,7 @@ impl<R: Resolve> CachedResolverBuilder<R> {
     }
 
     /// Sets a timeout that will be used to time out requests to the underlying resolver.
-    /// By default there is no timeout. So lookups using the underlying resolver will continue
+    /// By default there is no timeout. So resolutions using the underlying resolver will continue
     /// until they complete or return an error.
     pub fn timeout(mut self, resolver_timeout: Duration) -> Self {
         self.resolver_timeout = Some(resolver_timeout);
@@ -77,13 +77,14 @@ impl<R: Resolve> CachedResolverBuilder<R> {
     }
 
     /// Sets how old the cache for a domain has to be before a lookup of that domain triggers a
-    /// cache update with the underlying resolver, `R`. Not setting this means resolving a name
-    /// already in the cache will always just return the cached value directly.
+    /// resolution with the underlying resolver, `R`, in order to update the cache.
+    /// Not setting this means looking up a name already in the cache will always just return the
+    /// cached value directly.
     ///
     /// Note that if setting this at all, all entries given to [`cache`] are considered
-    /// immediately expired and will trigger a lookup on first access.
+    /// immediately expired and will trigger a resolution on first access.
     ///
-    /// Even expired cache entries are returned from this resolver if doing a lookup using
+    /// Even expired cache entries are returned from this resolver if doing a resolution using
     /// the underlying resolver fails. So "expired" in this context does not mean discarded.
     /// It just means that trying to access it attempts to update it, in contrast to just
     /// returning the cached value immediately.
@@ -124,12 +125,12 @@ pub struct CachedResolver<R: Resolve> {
     cache: HashMap<Name, CacheEntry>,
     cache_expiry: Option<Duration>,
     _cache_file: Option<PathBuf>,
-    handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<IntoIter<IpAddr>>)>>,
+    handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>)>>,
     ongoing_resolutions: HashMap<
         Name,
         (
             OptionalTimeout<R::Future>,
-            Vec<oneshot::Sender<IntoIter<IpAddr>>>,
+            Vec<oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>>,
         ),
     >,
 }
@@ -147,7 +148,7 @@ impl<R: Resolve> CachedResolver<R> {
             match self.handles_rx.poll() {
                 // Nothing new from the handles
                 Ok(Async::NotReady) => {
-                    break;
+                    return Async::NotReady;
                 }
                 // All handles are gone, no more requests will come in.
                 Ok(Async::Ready(None)) => {
@@ -157,11 +158,7 @@ impl<R: Resolve> CachedResolver<R> {
                 Ok(Async::Ready(Some((name, listener)))) => {
                     if let Some(addrs) = self.get_cache_entry(&name) {
                         log::debug!("Replying from cache for \"{}\" with {:?}", name, addrs);
-                        let _ = listener.send(addrs);
-                    } else if let Some((_fut, listeners)) = self.ongoing_resolutions.get_mut(&name)
-                    {
-                        log::trace!("Adding listener for existing resolution of \"{}\"", name);
-                        listeners.push(listener);
+                        let _ = listener.send(Ok(addrs));
                     } else {
                         self.resolve(name, listener);
                     }
@@ -173,7 +170,6 @@ impl<R: Resolve> CachedResolver<R> {
                 }
             }
         }
-        Async::NotReady
     }
 
     /// Returns the addresses for a name if it exists in the cache and the cache entry is not too
@@ -195,46 +191,56 @@ impl<R: Resolve> CachedResolver<R> {
         }
     }
 
-    fn resolve(&mut self, name: Name, listener: oneshot::Sender<IntoIter<IpAddr>>) {
-        log::debug!("Resolving \"{}\"", name);
-        let resolve_future =
-            OptionalTimeout::new(self.resolver.resolve(name.clone()), self.resolver_timeout);
-        let listeners = vec![listener];
-        self.ongoing_resolutions
-            .insert(name, (resolve_future, listeners));
+    fn resolve(
+        &mut self,
+        name: Name,
+        listener: oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>,
+    ) {
+        if let Some((_fut, listeners)) = self.ongoing_resolutions.get_mut(&name) {
+            log::trace!("Adding listener for existing resolutions of \"{}\"", name);
+            listeners.push(listener);
+        } else {
+            log::debug!("Resolving \"{}\"", name);
+            let resolve_future =
+                OptionalTimeout::new(self.resolver.resolve(name.clone()), self.resolver_timeout);
+            let listeners = vec![listener];
+            self.ongoing_resolutions
+                .insert(name, (resolve_future, listeners));
+        }
     }
 
     fn poll_ongoing_resolutions(&mut self) -> Async<()> {
         // Process all ongoing DNS resolutions
-        let mut finished_resolutions = Vec::new();
+        let mut finished_resolutions = HashMap::new();
+        let now = Instant::now();
         for (name, (resolve_future, _listeners)) in &mut self.ongoing_resolutions {
             match resolve_future.poll() {
                 Ok(Async::NotReady) => (),
                 Ok(Async::Ready(addrs_iter)) => {
+                    let addrs: Vec<IpAddr> = addrs_iter.collect();
+                    finished_resolutions.insert(name.clone(), Ok(addrs.clone().into_iter()));
                     let cache_entry = CacheEntry {
-                        addrs: addrs_iter.collect(),
-                        timestamp: Some(Instant::now()),
+                        addrs,
+                        timestamp: Some(now),
                     };
                     self.cache.insert(name.clone(), cache_entry);
-                    finished_resolutions.push(name.clone());
                 }
-                Err(error) => {
-                    log::error!("Unable to resolve \"{}\": {}", name, error);
-                    finished_resolutions.push(name.clone());
+                Err(timer_error) => {
+                    log::error!("Unable to resolve \"{}\": {}", name, timer_error);
+                    let resolve_error = ResolveError::from(timer_error);
+                    finished_resolutions.insert(name.clone(), Err(resolve_error));
                 }
             }
         }
-        for name in finished_resolutions {
+        for (name, result) in finished_resolutions {
             let (_resolve_future, listeners) = self.ongoing_resolutions.remove(&name).unwrap();
-            let addrs = self
-                .cache
-                .get(&name)
-                .map(|entry| &entry.addrs)
-                .cloned()
-                .unwrap_or_default();
-            log::debug!("Replying for \"{}\" with {:?}", name, addrs);
+            log::debug!("Replying for \"{}\" with {:?}", name, result);
             for listener in listeners {
-                let _ = listener.send(addrs.clone().into_iter());
+                let resolve_result = match &result {
+                    Ok(addrs) => Ok(addrs.clone()),
+                    Err(resolve_error) => Err(resolve_error.to_io_error()),
+                };
+                let _ = listener.send(resolve_result);
             }
         }
         if self.ongoing_resolutions.is_empty() {
@@ -269,7 +275,7 @@ impl<R: Resolve> Future for CachedResolver<R> {
 /// These handles will only work as long as their backing [`CachedResolver`] is running.
 #[derive(Clone)]
 pub struct ResolverHandle {
-    resolver: mpsc::Sender<(Name, oneshot::Sender<IntoIter<IpAddr>>)>,
+    resolver: mpsc::Sender<(Name, oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>)>,
 }
 
 impl Resolve for ResolverHandle {
@@ -287,13 +293,47 @@ impl Resolve for ResolverHandle {
                 log::error!("Unable to send request to CachedResolver: {:?}", e);
                 io::Error::new(io::ErrorKind::Other, "CachedResolver has been canceled")
             })
-            .and_then(|_self| {
-                response_rx.map_err(|e| {
-                    log::error!("No response from CachedResolver: {:?}", e);
-                    io::Error::new(io::ErrorKind::Other, "CachedResolver has been canceled")
-                })
+            .and_then(|_sender| {
+                response_rx
+                    .map_err(|e| {
+                        log::error!("No response from CachedResolver: {:?}", e);
+                        io::Error::new(io::ErrorKind::Other, "CachedResolver has been canceled")
+                    })
+                    .and_then(|response| response)
             });
         Box::new(f)
+    }
+}
+
+#[derive(Debug)]
+enum ResolveError {
+    Inner(String),
+    Timeout,
+    Timer(String),
+}
+
+impl ResolveError {
+    pub fn to_io_error(&self) -> io::Error {
+        use ResolveError::*;
+        match self {
+            Inner(msg) => io::Error::new(io::ErrorKind::Other, msg.as_str()),
+            Timeout => io::Error::new(io::ErrorKind::TimedOut, "The lookup timed out"),
+            Timer(msg) => io::Error::new(io::ErrorKind::Other, format!("Error in timer: {}", msg)),
+        }
+    }
+}
+
+impl From<timeout::Error<io::Error>> for ResolveError {
+    fn from(error: timeout::Error<io::Error>) -> Self {
+        if error.is_inner() {
+            ResolveError::Inner(error.into_inner().unwrap().to_string())
+        } else if error.is_elapsed() {
+            ResolveError::Timeout
+        } else if error.is_timer() {
+            ResolveError::Timer(error.into_timer().unwrap().to_string())
+        } else {
+            unreachable!("Timer error not one of the expected types");
+        }
     }
 }
 
@@ -360,11 +400,8 @@ mod tests {
 
         let mut runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.spawn(cached_resolver);
-        let result = runtime
-            .block_on(handle.resolve(name("example.com")))
-            .unwrap();
-        let expected: &[IpAddr] = &[];
-        assert_eq!(result.as_slice(), expected);
+        let result = runtime.block_on(handle.resolve(name("example.com")));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -403,11 +440,8 @@ mod tests {
         let expected: &[IpAddr] = &[Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()];
         assert_eq!(result.as_slice(), expected);
 
-        let result = runtime
-            .block_on(handle.resolve(name("not-in-cache.com")))
-            .unwrap();
-        let expected: &[IpAddr] = &[];
-        assert_eq!(result.as_slice(), expected);
+        let result = runtime.block_on(handle.resolve(name("not-in-cache.com")));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -486,9 +520,8 @@ mod tests {
             .resolve(name("some.not.cached.domain.org"))
             .timeout(Duration::from_millis(1000));
 
-        let result = runtime.block_on(time_limited_future).unwrap();
-        let expected: &[IpAddr] = &[];
-        assert_eq!(result.as_slice(), expected);
+        let result = runtime.block_on(time_limited_future);
+        assert!(result.is_err());
     }
 
     #[test]
