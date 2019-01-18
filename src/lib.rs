@@ -299,7 +299,7 @@ impl Resolve for ResolverHandle {
                         log::error!("No response from CachedResolver: {:?}", e);
                         io::Error::new(io::ErrorKind::Other, "CachedResolver has been canceled")
                     })
-                    .and_then(|response| response)
+                    .flatten()
             });
         Box::new(f)
     }
