@@ -16,7 +16,7 @@ matrix:
     # Oldest supported version. Bump when introducing changes that need newer Rust,
     # and write that in the changelog.
     - os: linux
-      rust: 1.31.0
+      rust: 1.32.0
 
 
 script:
