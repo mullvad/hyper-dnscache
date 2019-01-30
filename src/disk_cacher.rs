@@ -45,6 +45,12 @@ impl DiskCache for JsonCacher {
     }
 
     fn store(&mut self, cache: HashMap<Name, Vec<IpAddr>>) -> Result<(), Self::Error> {
+        log::debug!(
+            "Writing {} DNS entries to {}",
+            cache.len(),
+            self.0.display()
+        );
+
         let mut file_cache = HashMap::with_capacity(cache.len());
         for (name, addrs) in cache {
             file_cache.insert(name.to_string(), addrs);
@@ -53,7 +59,7 @@ impl DiskCache for JsonCacher {
         let cache_data = serde_json::to_vec_pretty(&file_cache)
             .map_err(|e| CacheError::SerializeCacheError(e))?;
         fs::write(&self.0, &cache_data).map_err(|e| CacheError::WriteFileError(e))?;
-        unimplemented!();
+        Ok(())
     }
 }
 

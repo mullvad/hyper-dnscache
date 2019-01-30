@@ -62,12 +62,11 @@ struct MockFileCacher {
 }
 
 impl MockFileCacher {
-    pub fn new(cache: HashMap<Name, Vec<IpAddr>>) -> (Self, mpsc::Receiver<HashMap<Name, Vec<IpAddr>>>) {
+    pub fn new(
+        cache: HashMap<Name, Vec<IpAddr>>,
+    ) -> (Self, mpsc::Receiver<HashMap<Name, Vec<IpAddr>>>) {
         let (tx, rx) = mpsc::channel();
-        let cacher = Self {
-            cache,
-            stores: tx,
-        };
+        let cacher = Self { cache, stores: tx };
         (cacher, rx)
     }
 }
@@ -76,12 +75,12 @@ impl DiskCache for MockFileCacher {
     type Error = io::Error;
 
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error> {
-        Ok(self.cache.clone())
+        Ok(dbg!(self.cache.clone()))
     }
 
     fn store(&mut self, cache: HashMap<Name, Vec<IpAddr>>) -> Result<(), Self::Error> {
         let _ = self.stores.send(cache.clone());
-        self.cache = cache;
+        self.cache = dbg!(cache);
         Ok(())
     }
 }
@@ -289,6 +288,33 @@ fn loads_disk_cache() {
         .unwrap();
     let expected: &[IpAddr] = &[Ipv4Addr::new(7, 6, 5, 4).into()];
     assert_eq!(result.as_slice(), expected);
+}
+
+#[test]
+fn stores_disk_cache() {
+    let resolver_domains = test_cache(&[("example.com", &[Ipv4Addr::new(2, 3, 4, 5).into()])]);
+    let (resolver, _mock_rx) = MockResolver::new(resolver_domains);
+    let (file_cacher, stores_rx) = MockFileCacher::new(HashMap::new());
+
+    let (cached_resolver, handle) = CachedResolver::builder(resolver)
+        .file_cacher(file_cacher)
+        .build()
+        .unwrap();
+
+    let mut runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.spawn(cached_resolver);
+
+    let result = runtime
+        .block_on(handle.resolve(name("example.com")))
+        .unwrap();
+    let expected: &[IpAddr] = &[Ipv4Addr::new(2, 3, 4, 5).into()];
+    assert_eq!(result.as_slice(), expected);
+    let store_cache = stores_rx.try_recv().expect("Store was never called");
+    assert_eq!(store_cache.len(), 1);
+    assert_eq!(
+        store_cache.get(&name("example.com")).map(Vec::as_slice),
+        Some(expected)
+    );
 }
 
 

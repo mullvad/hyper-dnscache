@@ -166,7 +166,7 @@ impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
             resolver_timeout: self.resolver_timeout,
             cache,
             cache_expiry: self.cache_expiry,
-            _file_cacher: self.file_cacher,
+            file_cacher: self.file_cacher,
             handles_rx: handles_rx.fuse(),
             ongoing_resolutions: HashMap::new(),
         };
@@ -177,12 +177,13 @@ impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
     }
 }
 
+
 pub struct CachedResolver<R: Resolve, C: DiskCache = disk_cacher::JsonCacher> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: HashMap<Name, CacheEntry>,
     cache_expiry: Option<Duration>,
-    _file_cacher: Option<C>,
+    file_cacher: Option<C>,
     handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>)>>,
     ongoing_resolutions: HashMap<
         Name,
@@ -290,6 +291,9 @@ impl<R: Resolve, C: DiskCache> CachedResolver<R, C> {
                 }
             }
         }
+        if !finished_resolutions.is_empty() {
+            self.persist_cache();
+        }
         for (name, result) in finished_resolutions {
             let (_resolve_future, listeners) = self.ongoing_resolutions.remove(&name).unwrap();
             log::debug!("Replying for \"{}\" with {:?}", name, result);
@@ -307,6 +311,29 @@ impl<R: Resolve, C: DiskCache> CachedResolver<R, C> {
             Async::NotReady
         }
     }
+
+    fn persist_cache(&mut self) {
+        if let Some(file_cacher) = &mut self.file_cacher {
+            let mut cache = HashMap::with_capacity(self.cache.len());
+            for (name, cache_entry) in &self.cache {
+                cache.insert(name.clone(), cache_entry.addrs.clone());
+            }
+            if let Err(e) = file_cacher.store(cache) {
+                log_error("Failed to persist cache", &e);
+            }
+        }
+    }
+}
+
+fn log_error(msg: &str, error: &impl std::error::Error) {
+    let mut buffer = format!("Error: {}", msg);
+    let mut source: Option<&dyn std::error::Error> = Some(error);
+    while let Some(error) = source {
+        buffer.push_str("\nCaused by: ");
+        buffer.push_str(&error.to_string());
+        source = error.source();
+    }
+    log::error!("{}", buffer);
 }
 
 impl<R: Resolve, C: DiskCache> Future for CachedResolver<R, C> {
