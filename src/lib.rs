@@ -4,6 +4,7 @@ use futures::{
     Async, Future, Poll, Sink, Stream,
 };
 use hyper::client::connect::dns::{Name, Resolve};
+use log::debug;
 use std::{
     collections::HashMap,
     io,
@@ -14,13 +15,16 @@ use std::{
 };
 
 // TODO:
-// * Read cache on creation
-// * Writing cache to disk on each change
-// * Optional filtering of results from underlying resolver
+// * Use proper async filesystem operations inside JsonStorer.
+// * Optional filtering of results from underlying resolver.
+// * Limit the size of the in-memory cache. Use an LRU cache or similar.
+
+
+pub mod cache_storer;
+pub use cache_storer::CacheStorer;
 
 mod timeout;
 use self::timeout::OptionalTimeout;
-
 
 struct CacheEntry {
     /// The IPs for this domain.
@@ -31,24 +35,46 @@ struct CacheEntry {
 }
 
 /// Builder for [`CachedResolver`].
-pub struct CachedResolverBuilder<R: Resolve> {
+pub struct CachedResolverBuilder<R: Resolve, C: CacheStorer = cache_storer::JsonStorer> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: Option<HashMap<Name, CacheEntry>>,
     cache_expiry: Option<Duration>,
-    cache_file: Option<PathBuf>,
+    cache_storer: Option<C>,
 }
 
-impl<R: Resolve> CachedResolverBuilder<R> {
+impl<R: Resolve> CachedResolverBuilder<R, cache_storer::JsonStorer> {
+    /// Sets a file path to load cache from/store cache to. If this is set then the file will be
+    /// read and parsed in [`build`]. Any entries from the file that overlaps with entries given
+    /// to [`cache`] will replace those for the in-memory cache of the resulting
+    /// [`CachedResolver`].
+    ///
+    /// At any point where the in-memory cache is updated thanks to a resolution with the underlying
+    /// resolver, the in-memory cache will be serialized and written to the file at the path given
+    /// here.
+    ///
+    /// This method is just a shorthand for calling [`cache_storer`] with
+    /// `JsonStorer::new(cache_file)`
+    ///
+    /// [`build`]: #method.build
+    /// [`cache`]: #method.cache
+    /// [`cache_storer`]: #method.cache_storer
+    pub fn cache_file(mut self, cache_file: impl Into<PathBuf>) -> Self {
+        self.cache_storer = Some(cache_storer::JsonStorer::new(cache_file));
+        self
+    }
+}
+
+impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
     /// Returns a new builder that will build a [`CachedResolver`] using `resolver` as the
     /// underlying DNS resolver.
-    pub fn new(resolver: R) -> Self {
+    pub fn new(resolver: R, cache_storer: Option<C>) -> Self {
         Self {
             resolver,
             resolver_timeout: None,
             cache: None,
             cache_expiry: None,
-            cache_file: None,
+            cache_storer,
         }
     }
 
@@ -76,6 +102,18 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         self
     }
 
+    /// Changes the [`CacheStorer`] implementation instance for this builder. Allows customizing
+    /// how the cache is serialized and persisted.
+    pub fn cache_storer<C2: CacheStorer>(self, cache_storer: C2) -> CachedResolverBuilder<R, C2> {
+        CachedResolverBuilder {
+            resolver: self.resolver,
+            resolver_timeout: self.resolver_timeout,
+            cache: self.cache,
+            cache_expiry: self.cache_expiry,
+            cache_storer: Some(cache_storer),
+        }
+    }
+
     /// Sets how old the cache for a domain has to be before a lookup of that domain triggers a
     /// resolution with the underlying resolver, `R`, in order to update the cache.
     /// Not setting this means looking up a name already in the cache will always just return the
@@ -95,36 +133,57 @@ impl<R: Resolve> CachedResolverBuilder<R> {
         self
     }
 
-    pub fn cache_file(mut self, cache_file: impl Into<PathBuf>) -> Self {
-        self.cache_file = Some(cache_file.into());
-        self
-    }
-
     /// Constructs the [`CachedResolver`] and the corresponding [`ResolverHandle`].
-    pub fn build(self) -> (CachedResolver<R>, ResolverHandle) {
+    ///
+    /// Returns an error if [`cache_storer`] or [`cache_file`] is set and the active cacher, `C`,
+    /// fails to load the cache.
+    ///
+    /// [`cache_file`]: #method.cache_file
+    /// [`cache_storer`]: #method.cache_storer
+    pub fn build(mut self) -> Result<(CachedResolver<R, C>, ResolverHandle), C::Error> {
+        // Start out with the provided in-memory cache, or an empty one.
+        let mut cache = self.cache.unwrap_or_default();
+        if let Some(cache_storer) = &mut self.cache_storer {
+            let loaded_cache = cache_storer.load()?;
+            for (name, addrs) in loaded_cache {
+                cache.insert(
+                    name,
+                    CacheEntry {
+                        addrs,
+                        timestamp: None,
+                    },
+                );
+            }
+        }
+        debug!(
+            "Building CachedResolver with {} entries in the cache.",
+            cache.len()
+        );
+
         let (handles_tx, handles_rx) = mpsc::channel(0);
         let cached_resolver = CachedResolver {
             resolver: self.resolver,
             resolver_timeout: self.resolver_timeout,
-            cache: self.cache.unwrap_or_default(),
+            cache,
             cache_expiry: self.cache_expiry,
-            _cache_file: self.cache_file,
+            cache_storer: self.cache_storer,
             handles_rx: handles_rx.fuse(),
             ongoing_resolutions: HashMap::new(),
         };
         let handle = ResolverHandle {
             resolver: handles_tx,
         };
-        (cached_resolver, handle)
+        Ok((cached_resolver, handle))
     }
 }
 
-pub struct CachedResolver<R: Resolve> {
+
+pub struct CachedResolver<R: Resolve, C: CacheStorer = cache_storer::JsonStorer> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: HashMap<Name, CacheEntry>,
     cache_expiry: Option<Duration>,
-    _cache_file: Option<PathBuf>,
+    cache_storer: Option<C>,
     handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>)>>,
     ongoing_resolutions: HashMap<
         Name,
@@ -135,13 +194,13 @@ pub struct CachedResolver<R: Resolve> {
     >,
 }
 
-impl<R: Resolve> CachedResolver<R> {
-    pub fn builder(resolver: R) -> CachedResolverBuilder<R> {
-        CachedResolverBuilder::new(resolver)
+impl<R: Resolve> CachedResolver<R, cache_storer::JsonStorer> {
+    pub fn builder(resolver: R) -> CachedResolverBuilder<R, cache_storer::JsonStorer> {
+        CachedResolverBuilder::new(resolver, None)
     }
 }
 
-impl<R: Resolve> CachedResolver<R> {
+impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
     fn poll_handles(&mut self) -> Async<()> {
         // Process requests from all handles
         loop {
@@ -232,6 +291,9 @@ impl<R: Resolve> CachedResolver<R> {
                 }
             }
         }
+        if !finished_resolutions.is_empty() {
+            self.persist_cache();
+        }
         for (name, result) in finished_resolutions {
             let (_resolve_future, listeners) = self.ongoing_resolutions.remove(&name).unwrap();
             log::debug!("Replying for \"{}\" with {:?}", name, result);
@@ -249,9 +311,32 @@ impl<R: Resolve> CachedResolver<R> {
             Async::NotReady
         }
     }
+
+    fn persist_cache(&mut self) {
+        if let Some(cache_storer) = &mut self.cache_storer {
+            let mut cache = HashMap::with_capacity(self.cache.len());
+            for (name, cache_entry) in &self.cache {
+                cache.insert(name.clone(), cache_entry.addrs.clone());
+            }
+            if let Err(e) = cache_storer.store(cache) {
+                log_error("Failed to persist cache", &e);
+            }
+        }
+    }
 }
 
-impl<R: Resolve> Future for CachedResolver<R> {
+fn log_error(msg: &str, error: &impl std::error::Error) {
+    let mut buffer = format!("Error: {}", msg);
+    let mut source: Option<&dyn std::error::Error> = Some(error);
+    while let Some(error) = source {
+        buffer.push_str("\nCaused by: ");
+        buffer.push_str(&error.to_string());
+        source = error.source();
+    }
+    log::error!("{}", buffer);
+}
+
+impl<R: Resolve, C: CacheStorer> Future for CachedResolver<R, C> {
     type Item = ();
     type Error = ();
 
@@ -334,248 +419,5 @@ impl From<timeout::Error<io::Error>> for ResolveError {
         } else {
             unreachable!("Timer error not one of the expected types");
         }
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::future;
-    use std::{
-        net::{Ipv4Addr, Ipv6Addr},
-        str::FromStr,
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
-    use tokio::prelude::FutureExt;
-
-    struct MockResolver {
-        cache: HashMap<Name, Vec<IpAddr>>,
-        requests: mpsc::Sender<Name>,
-    }
-
-    impl MockResolver {
-        pub fn new(cache: HashMap<Name, Vec<IpAddr>>) -> (Self, mpsc::Receiver<Name>) {
-            let (tx, rx) = mpsc::channel();
-            let resolver = Self {
-                cache,
-                requests: tx,
-            };
-            (resolver, rx)
-        }
-    }
-
-    impl Resolve for MockResolver {
-        type Addrs = IntoIter<IpAddr>;
-        type Future = future::FutureResult<Self::Addrs, io::Error>;
-        fn resolve(&self, name: Name) -> Self::Future {
-            log::debug!("Mock resolving {}", name);
-            let _ = self.requests.send(name.clone());
-            if let Some(addrs) = self.cache.get(&name) {
-                future::ok(addrs.clone().into_iter())
-            } else {
-                future::err(io::Error::new(io::ErrorKind::Other, "fail"))
-            }
-        }
-    }
-
-    // A test resolver that never replies.
-    struct SlowMockResolver;
-
-    impl Resolve for SlowMockResolver {
-        type Addrs = IntoIter<IpAddr>;
-        type Future = future::Empty<Self::Addrs, io::Error>;
-        fn resolve(&self, name: Name) -> Self::Future {
-            log::debug!("Mock resolving {} (will never reply)", name.as_str());
-            future::empty()
-        }
-    }
-
-    #[test]
-    fn no_cache_failing_resolver() {
-        let (resolver, _) = MockResolver::new(HashMap::new());
-        let (cached_resolver, handle) = CachedResolver::builder(resolver).build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-        let result = runtime.block_on(handle.resolve(name("example.com")));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn with_cache_failing_resolver() {
-        let cache = test_cache(&[
-            ("example.com", &[Ipv4Addr::LOCALHOST.into()]),
-            ("test1.example.com", &[Ipv6Addr::LOCALHOST.into()]),
-            (
-                "website.com",
-                &[Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()],
-            ),
-        ]);
-
-        let (resolver, _) = MockResolver::new(HashMap::new());
-
-        let (cached_resolver, handle) = CachedResolver::builder(resolver).cache(cache).build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-
-        let result = runtime
-            .block_on(handle.resolve(name("example.com")))
-            .unwrap();
-        let expected: &[IpAddr] = &[Ipv4Addr::LOCALHOST.into()];
-        assert_eq!(result.as_slice(), expected);
-
-        let result = runtime
-            .block_on(handle.resolve(name("test1.example.com")))
-            .unwrap();
-        let expected: &[IpAddr] = &[Ipv6Addr::LOCALHOST.into()];
-        assert_eq!(result.as_slice(), expected);
-
-        let result = runtime
-            .block_on(handle.resolve(name("website.com")))
-            .unwrap();
-        let expected: &[IpAddr] = &[Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()];
-        assert_eq!(result.as_slice(), expected);
-
-        let result = runtime.block_on(handle.resolve(name("not-in-cache.com")));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn no_cache_working_resolver() {
-        let domains = test_cache(&[("example.com", &[Ipv4Addr::new(10, 9, 8, 7).into()])]);
-
-        let (resolver, _) = MockResolver::new(domains);
-
-        let (cached_resolver, handle) = CachedResolver::builder(resolver).build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-
-        let result = runtime
-            .block_on(handle.resolve(name("example.com")))
-            .unwrap();
-        let expected: &[IpAddr] = &[Ipv4Addr::new(10, 9, 8, 7).into()];
-        assert_eq!(result.as_slice(), expected);
-    }
-
-    #[test]
-    fn prefer_cache_over_resolver() {
-        let resolver_domains = test_cache(&[("cached.net", &[Ipv4Addr::new(10, 9, 8, 7).into()])]);
-        let cache = test_cache(&[("cached.net", &[Ipv6Addr::LOCALHOST.into()])]);
-
-        let (resolver, _) = MockResolver::new(resolver_domains);
-        let (cached_resolver, handle) = CachedResolver::builder(resolver).cache(cache).build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-
-        let result = runtime
-            .block_on(handle.resolve(name("cached.net")))
-            .unwrap();
-        let expected: &[IpAddr] = &[Ipv6Addr::LOCALHOST.into()];
-        assert_eq!(result.as_slice(), expected);
-    }
-
-    #[test]
-    fn timeout_slow_resolver() {
-        let (cached_resolver, handle) = CachedResolver::builder(SlowMockResolver)
-            .timeout(Duration::from_millis(1000))
-            .build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-
-        let time_limited_future = handle
-            .resolve(name("some.domain.org"))
-            .timeout(Duration::from_millis(100));
-
-        runtime.block_on(time_limited_future).unwrap_err();
-    }
-
-    #[test]
-    fn slow_resolver_uses_cache_or_empty_result() {
-        let cache = test_cache(&[("a.cached.domain.it", &[Ipv4Addr::new(7, 6, 5, 4).into()])]);
-
-        let (cached_resolver, handle) = CachedResolver::builder(SlowMockResolver)
-            .timeout(Duration::from_millis(100))
-            .cache(cache)
-            .build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-
-        let time_limited_future = handle
-            .resolve(name("a.cached.domain.it"))
-            .timeout(Duration::from_millis(1000));
-
-        let result = runtime.block_on(time_limited_future).unwrap();
-        let expected: &[IpAddr] = &[Ipv4Addr::new(7, 6, 5, 4).into()];
-        assert_eq!(result.as_slice(), expected);
-
-        let time_limited_future = handle
-            .resolve(name("some.not.cached.domain.org"))
-            .timeout(Duration::from_millis(1000));
-
-        let result = runtime.block_on(time_limited_future);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn cache_expiry_causes_resolve() {
-        let cache = test_cache(&[("a.cached.domain.it", &[Ipv4Addr::new(7, 6, 5, 4).into()])]);
-        let resolver_domains =
-            test_cache(&[("a.cached.domain.it", &[Ipv4Addr::new(100, 1, 2, 3).into()])]);
-
-        let (resolver, mock_rx) = MockResolver::new(resolver_domains);
-
-        let (cached_resolver, handle) = CachedResolver::builder(resolver)
-            .cache(cache)
-            .cache_expiry(Duration::from_millis(100))
-            .build();
-
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.spawn(cached_resolver);
-
-        // Cache should always be treated as expired from the start
-        let result = runtime
-            .block_on(handle.resolve(name("a.cached.domain.it")))
-            .unwrap();
-        let expected: &[IpAddr] = &[Ipv4Addr::new(100, 1, 2, 3).into()];
-        assert_eq!(result.as_slice(), expected);
-        assert_eq!(mock_rx.try_recv(), Ok(name("a.cached.domain.it")));
-        assert!(mock_rx.try_recv().is_err());
-
-        // Now the cache should be valid, and not cause a resolve
-        let result = runtime
-            .block_on(handle.resolve(name("a.cached.domain.it")))
-            .unwrap();
-        assert_eq!(result.as_slice(), expected);
-        assert!(mock_rx.try_recv().is_err());
-
-        thread::sleep(Duration::from_secs(1));
-
-        // Now the cache should have expired again, triggering a resolve
-        let result = runtime
-            .block_on(handle.resolve(name("a.cached.domain.it")))
-            .unwrap();
-        assert_eq!(result.as_slice(), expected);
-        assert_eq!(mock_rx.try_recv(), Ok(name("a.cached.domain.it")));
-        assert!(mock_rx.try_recv().is_err());
-    }
-
-    fn name(name: &str) -> Name {
-        Name::from_str(name).unwrap()
-    }
-
-    fn test_cache(entries: &[(&str, &[IpAddr])]) -> HashMap<Name, Vec<IpAddr>> {
-        let mut cache = HashMap::new();
-        for entry in entries {
-            cache.insert(Name::from_str(entry.0).unwrap(), entry.1.to_vec());
-        }
-        cache
     }
 }
