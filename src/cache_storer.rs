@@ -28,8 +28,7 @@ impl CacheStorer for JsonStorer {
         let file_cache: HashMap<String, Vec<IpAddr>> = serde_json::from_slice(&cache_data)
             .map_err(|e| Error::DeserializeCacheError(self.0.clone(), e))?;
 
-        // Insert all entries from the cache loaded from disk. May overwrite entries from the
-        // first in-memory cache.
+        // Convert the map so the `String` key becomes a `Name`.
         let mut cache = HashMap::with_capacity(file_cache.len());
         for (name_str, addrs) in file_cache {
             let name = Name::from_str(&name_str)
@@ -51,10 +50,11 @@ impl CacheStorer for JsonStorer {
             self.0.display()
         );
 
-        let mut file_cache = HashMap::with_capacity(cache.len());
-        for (name, addrs) in cache {
-            file_cache.insert(name.to_string(), addrs);
-        }
+        // Convert the map so the `Name` key becomes a `String`.
+        let file_cache: HashMap<String, Vec<IpAddr>> = cache
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
 
         let cache_data =
             serde_json::to_vec_pretty(&file_cache).map_err(|e| Error::SerializeCacheError(e))?;
