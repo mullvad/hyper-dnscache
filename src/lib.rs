@@ -21,8 +21,8 @@ use std::{
 // * Limit the size of the in-memory cache. Use an LRU cache or similar.
 
 
-pub mod disk_cacher;
-pub use disk_cacher::DiskCache;
+pub mod cache_storer;
+pub use cache_storer::CacheStorer;
 
 mod timeout;
 use self::timeout::OptionalTimeout;
@@ -36,15 +36,15 @@ struct CacheEntry {
 }
 
 /// Builder for [`CachedResolver`].
-pub struct CachedResolverBuilder<R: Resolve, C: DiskCache = disk_cacher::JsonCacher> {
+pub struct CachedResolverBuilder<R: Resolve, C: CacheStorer = cache_storer::JsonStorer> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: Option<HashMap<Name, CacheEntry>>,
     cache_expiry: Option<Duration>,
-    file_cacher: Option<C>,
+    cache_storer: Option<C>,
 }
 
-impl<R: Resolve> CachedResolverBuilder<R, disk_cacher::JsonCacher> {
+impl<R: Resolve> CachedResolverBuilder<R, cache_storer::JsonStorer> {
     /// Sets a file path to load cache from/store cache to. If this is set then the file will be
     /// read and parsed in [`build`]. Any entries from the file that overlaps with entries given
     /// to [`cache`] will replace those for the in-memory cache of the resulting
@@ -54,28 +54,28 @@ impl<R: Resolve> CachedResolverBuilder<R, disk_cacher::JsonCacher> {
     /// resolver, the in-memory cache will be serialized and written to the file at the path given
     /// here.
     ///
-    /// This method is just a shorthand for calling [`file_cacher`] with
-    /// `JsonCacher::new(cache_file)`
+    /// This method is just a shorthand for calling [`cache_storer`] with
+    /// `JsonStorer::new(cache_file)`
     ///
     /// [`build`]: #method.build
     /// [`cache`]: #method.cache
-    /// [`file_cacher`]: #method.file_cacher
+    /// [`cache_storer`]: #method.cache_storer
     pub fn cache_file(mut self, cache_file: impl Into<PathBuf>) -> Self {
-        self.file_cacher = Some(disk_cacher::JsonCacher::new(cache_file));
+        self.cache_storer = Some(cache_storer::JsonStorer::new(cache_file));
         self
     }
 }
 
-impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
+impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
     /// Returns a new builder that will build a [`CachedResolver`] using `resolver` as the
     /// underlying DNS resolver.
-    pub fn new(resolver: R, file_cacher: Option<C>) -> Self {
+    pub fn new(resolver: R, cache_storer: Option<C>) -> Self {
         Self {
             resolver,
             resolver_timeout: None,
             cache: None,
             cache_expiry: None,
-            file_cacher,
+            cache_storer,
         }
     }
 
@@ -103,15 +103,15 @@ impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
         self
     }
 
-    /// Changes the [`DiskCache`] implementation instance for this builder. Allows customizing
+    /// Changes the [`CacheStorer`] implementation instance for this builder. Allows customizing
     /// how the cache is serialized and persisted.
-    pub fn file_cacher<C2: DiskCache>(self, file_cacher: C2) -> CachedResolverBuilder<R, C2> {
+    pub fn cache_storer<C2: CacheStorer>(self, cache_storer: C2) -> CachedResolverBuilder<R, C2> {
         CachedResolverBuilder {
             resolver: self.resolver,
             resolver_timeout: self.resolver_timeout,
             cache: self.cache,
             cache_expiry: self.cache_expiry,
-            file_cacher: Some(file_cacher),
+            cache_storer: Some(cache_storer),
         }
     }
 
@@ -136,16 +136,17 @@ impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
 
     /// Constructs the [`CachedResolver`] and the corresponding [`ResolverHandle`].
     ///
-    /// Returns an error if [`cache_file`] is set and the active cacher, `C`, fails to load the
-    /// cache.
+    /// Returns an error if [`cache_storer`] or [`cache_file`] is set and the active cacher, `C`,
+    /// fails to load the cache.
     ///
     /// [`cache_file`]: #method.cache_file
+    /// [`cache_storer`]: #method.cache_storer
     pub fn build(mut self) -> Result<(CachedResolver<R, C>, ResolverHandle), C::Error> {
         // Start out with the provided in-memory cache, or an empty one.
         let mut cache = self.cache.unwrap_or_default();
-        if let Some(file_cacher) = &mut self.file_cacher {
-            let file_cache = file_cacher.load()?;
-            for (name, addrs) in file_cache {
+        if let Some(cache_storer) = &mut self.cache_storer {
+            let loaded_cache = cache_storer.load()?;
+            for (name, addrs) in loaded_cache {
                 cache.insert(
                     name,
                     CacheEntry {
@@ -166,7 +167,7 @@ impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
             resolver_timeout: self.resolver_timeout,
             cache,
             cache_expiry: self.cache_expiry,
-            file_cacher: self.file_cacher,
+            cache_storer: self.cache_storer,
             handles_rx: handles_rx.fuse(),
             ongoing_resolutions: HashMap::new(),
         };
@@ -178,12 +179,12 @@ impl<R: Resolve, C: DiskCache> CachedResolverBuilder<R, C> {
 }
 
 
-pub struct CachedResolver<R: Resolve, C: DiskCache = disk_cacher::JsonCacher> {
+pub struct CachedResolver<R: Resolve, C: CacheStorer = cache_storer::JsonStorer> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: HashMap<Name, CacheEntry>,
     cache_expiry: Option<Duration>,
-    file_cacher: Option<C>,
+    cache_storer: Option<C>,
     handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>)>>,
     ongoing_resolutions: HashMap<
         Name,
@@ -194,13 +195,13 @@ pub struct CachedResolver<R: Resolve, C: DiskCache = disk_cacher::JsonCacher> {
     >,
 }
 
-impl<R: Resolve> CachedResolver<R, disk_cacher::JsonCacher> {
-    pub fn builder(resolver: R) -> CachedResolverBuilder<R, disk_cacher::JsonCacher> {
+impl<R: Resolve> CachedResolver<R, cache_storer::JsonStorer> {
+    pub fn builder(resolver: R) -> CachedResolverBuilder<R, cache_storer::JsonStorer> {
         CachedResolverBuilder::new(resolver, None)
     }
 }
 
-impl<R: Resolve, C: DiskCache> CachedResolver<R, C> {
+impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
     fn poll_handles(&mut self) -> Async<()> {
         // Process requests from all handles
         loop {
@@ -313,12 +314,12 @@ impl<R: Resolve, C: DiskCache> CachedResolver<R, C> {
     }
 
     fn persist_cache(&mut self) {
-        if let Some(file_cacher) = &mut self.file_cacher {
+        if let Some(cache_storer) = &mut self.cache_storer {
             let mut cache = HashMap::with_capacity(self.cache.len());
             for (name, cache_entry) in &self.cache {
                 cache.insert(name.clone(), cache_entry.addrs.clone());
             }
-            if let Err(e) = file_cacher.store(cache) {
+            if let Err(e) = cache_storer.store(cache) {
                 log_error("Failed to persist cache", &e);
             }
         }
@@ -336,7 +337,7 @@ fn log_error(msg: &str, error: &impl std::error::Error) {
     log::error!("{}", buffer);
 }
 
-impl<R: Resolve, C: DiskCache> Future for CachedResolver<R, C> {
+impl<R: Resolve, C: CacheStorer> Future for CachedResolver<R, C> {
     type Item = ();
     type Error = ();
 

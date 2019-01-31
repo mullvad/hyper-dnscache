@@ -56,12 +56,12 @@ impl Resolve for SlowMockResolver {
     }
 }
 
-struct MockFileCacher {
+struct MockStorer {
     cache: HashMap<Name, Vec<IpAddr>>,
     stores: mpsc::Sender<HashMap<Name, Vec<IpAddr>>>,
 }
 
-impl MockFileCacher {
+impl MockStorer {
     pub fn new(
         cache: HashMap<Name, Vec<IpAddr>>,
     ) -> (Self, mpsc::Receiver<HashMap<Name, Vec<IpAddr>>>) {
@@ -71,7 +71,7 @@ impl MockFileCacher {
     }
 }
 
-impl DiskCache for MockFileCacher {
+impl CacheStorer for MockStorer {
     type Error = io::Error;
 
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error> {
@@ -273,10 +273,10 @@ fn cache_expiry_causes_resolve() {
 fn loads_disk_cache() {
     let (resolver, _mock_rx) = MockResolver::new(HashMap::new());
     let file_cache = test_cache(&[("a.cached.domain.it", &[Ipv4Addr::new(7, 6, 5, 4).into()])]);
-    let (file_cacher, _) = MockFileCacher::new(file_cache);
+    let (cache_storer, _) = MockStorer::new(file_cache);
 
     let (cached_resolver, handle) = CachedResolver::builder(resolver)
-        .file_cacher(file_cacher)
+        .cache_storer(cache_storer)
         .build()
         .unwrap();
 
@@ -294,10 +294,10 @@ fn loads_disk_cache() {
 fn stores_disk_cache() {
     let resolver_domains = test_cache(&[("example.com", &[Ipv4Addr::new(2, 3, 4, 5).into()])]);
     let (resolver, _mock_rx) = MockResolver::new(resolver_domains);
-    let (file_cacher, stores_rx) = MockFileCacher::new(HashMap::new());
+    let (cache_storer, stores_rx) = MockStorer::new(HashMap::new());
 
     let (cached_resolver, handle) = CachedResolver::builder(resolver)
-        .file_cacher(file_cacher)
+        .cache_storer(cache_storer)
         .build()
         .unwrap();
 

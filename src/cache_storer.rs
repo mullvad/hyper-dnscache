@@ -1,7 +1,7 @@
 use hyper::client::connect::dns::{InvalidNameError, Name};
 use std::{collections::HashMap, fs, io, net::IpAddr, path::PathBuf, str::FromStr};
 
-pub trait DiskCache {
+pub trait CacheStorer {
     type Error: std::error::Error;
 
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error>;
@@ -10,16 +10,16 @@ pub trait DiskCache {
 }
 
 
-/// The default `DiskCache` implementation. Stores the DNS cache serialized as JSON.
-pub struct JsonCacher(PathBuf);
+/// The default `CacheStorer` implementation. Stores the DNS cache serialized as JSON.
+pub struct JsonStorer(PathBuf);
 
-impl JsonCacher {
+impl JsonStorer {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self(path.into())
     }
 }
 
-impl DiskCache for JsonCacher {
+impl CacheStorer for JsonStorer {
     type Error = Error;
 
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error> {
