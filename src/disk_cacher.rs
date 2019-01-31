@@ -1,4 +1,4 @@
-use hyper::client::connect::dns::Name;
+use hyper::client::connect::dns::{InvalidNameError, Name};
 use std::{collections::HashMap, fs, io, net::IpAddr, path::PathBuf, str::FromStr};
 
 pub trait DiskCache {
@@ -20,20 +20,20 @@ impl JsonCacher {
 }
 
 impl DiskCache for JsonCacher {
-    type Error = CacheError;
+    type Error = Error;
 
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error> {
         // Load and deserialize cache file.
-        let cache_data = fs::read(&self.0).map_err(|e| CacheError::ReadFileError(e))?;
-        let file_cache: HashMap<String, Vec<IpAddr>> = serde_json::from_slice(&cache_data)
-            .map_err(|e| CacheError::DeserializeCacheError(e))?;
+        let cache_data = fs::read(&self.0).map_err(|e| Error::ReadFileError(self.0.clone(), e))?;
+        let file_cache: HashMap<String, Vec<IpAddr>> =
+            serde_json::from_slice(&cache_data).map_err(|e| Error::DeserializeCacheError(e))?;
 
         // Insert all entries from the cache loaded from disk. May overwrite entries from the
         // first in-memory cache.
         let mut cache = HashMap::with_capacity(file_cache.len());
         for (name_str, addrs) in file_cache {
-            let name =
-                Name::from_str(&name_str).map_err(|e| CacheError::InvalidDomainNameError(e))?;
+            let name = Name::from_str(&name_str)
+                .map_err(|e| Error::InvalidDomainNameError(name_str, e))?;
             cache.insert(name, addrs);
         }
         log::debug!(
@@ -56,23 +56,23 @@ impl DiskCache for JsonCacher {
             file_cache.insert(name.to_string(), addrs);
         }
 
-        let cache_data = serde_json::to_vec_pretty(&file_cache)
-            .map_err(|e| CacheError::SerializeCacheError(e))?;
-        fs::write(&self.0, &cache_data).map_err(|e| CacheError::WriteFileError(e))?;
+        let cache_data =
+            serde_json::to_vec_pretty(&file_cache).map_err(|e| Error::SerializeCacheError(e))?;
+        fs::write(&self.0, &cache_data).map_err(|e| Error::WriteFileError(self.0.clone(), e))?;
         Ok(())
     }
 }
 
 #[derive(Debug, err_derive::Error)]
-pub enum CacheError {
-    #[error(display = "Failed to read cache file content")]
-    ReadFileError(#[error(cause)] io::Error),
+pub enum Error {
+    #[error(display = "Failed to read cache file at {:?}", _0)]
+    ReadFileError(PathBuf, #[error(cause)] io::Error),
     #[error(display = "Failed to deserialize cache file content")]
     DeserializeCacheError(#[error(cause)] serde_json::Error),
-    #[error(display = "Cache contained invalid domain name")]
-    InvalidDomainNameError(#[error(cause)] hyper::client::connect::dns::InvalidNameError),
-    #[error(display = "Failed to write serialized cache data to file")]
-    WriteFileError(#[error(cause)] io::Error),
+    #[error(display = "Cache contained invalid domain name: {}", _0)]
+    InvalidDomainNameError(String, #[error(cause)] InvalidNameError),
+    #[error(display = "Failed to write cache data to {:?}", _0)]
+    WriteFileError(PathBuf, #[error(cause)] io::Error),
     #[error(display = "Failed to serialize cache")]
     SerializeCacheError(#[error(cause)] serde_json::Error),
 }
