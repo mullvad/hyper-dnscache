@@ -15,9 +15,8 @@ use std::{
 };
 
 // TODO:
-// * Read cache on creation
-// * Writing cache to disk on each change
-// * Optional filtering of results from underlying resolver
+// * Use proper async filesystem operations inside JsonStorer.
+// * Optional filtering of results from underlying resolver.
 // * Limit the size of the in-memory cache. Use an LRU cache or similar.
 
 
