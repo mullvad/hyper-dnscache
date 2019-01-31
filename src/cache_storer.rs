@@ -25,8 +25,8 @@ impl CacheStorer for JsonStorer {
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error> {
         // Load and deserialize cache file.
         let cache_data = fs::read(&self.0).map_err(|e| Error::ReadFileError(self.0.clone(), e))?;
-        let file_cache: HashMap<String, Vec<IpAddr>> =
-            serde_json::from_slice(&cache_data).map_err(|e| Error::DeserializeCacheError(e))?;
+        let file_cache: HashMap<String, Vec<IpAddr>> = serde_json::from_slice(&cache_data)
+            .map_err(|e| Error::DeserializeCacheError(self.0.clone(), e))?;
 
         // Insert all entries from the cache loaded from disk. May overwrite entries from the
         // first in-memory cache.
@@ -67,8 +67,8 @@ impl CacheStorer for JsonStorer {
 pub enum Error {
     #[error(display = "Failed to read cache file at {:?}", _0)]
     ReadFileError(PathBuf, #[error(cause)] io::Error),
-    #[error(display = "Failed to deserialize cache file content")]
-    DeserializeCacheError(#[error(cause)] serde_json::Error),
+    #[error(display = "Failed to deserialize cache file at {:?}", _0)]
+    DeserializeCacheError(PathBuf, #[error(cause)] serde_json::Error),
     #[error(display = "Cache contained invalid domain name: {}", _0)]
     InvalidDomainNameError(String, #[error(cause)] InvalidNameError),
     #[error(display = "Failed to write cache data to {:?}", _0)]
