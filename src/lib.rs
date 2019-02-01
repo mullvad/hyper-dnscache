@@ -15,7 +15,6 @@ use std::{
 };
 
 // TODO:
-// * Use proper async filesystem operations inside JsonStorer.
 // * Optional filtering of results from underlying resolver.
 // * Limit the size of the in-memory cache. Use an LRU cache or similar.
 
@@ -103,7 +102,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
     }
 
     /// Changes the [`CacheStorer`] implementation instance for this builder. Allows customizing
-    /// how the cache is serialized and persisted.
+    /// how the cache is serialized and stored.
     pub fn cache_storer<C2: CacheStorer>(self, cache_storer: C2) -> CachedResolverBuilder<R, C2> {
         CachedResolverBuilder {
             resolver: self.resolver,
@@ -169,6 +168,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
             cache_storer: self.cache_storer,
             handles_rx: handles_rx.fuse(),
             ongoing_resolutions: HashMap::new(),
+            ongoing_store: None,
         };
         let handle = ResolverHandle {
             resolver: handles_tx,
@@ -192,6 +192,7 @@ pub struct CachedResolver<R: Resolve, C: CacheStorer = cache_storer::JsonStorer>
             Vec<oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>>,
         ),
     >,
+    ongoing_store: Option<C::StoreFuture>,
 }
 
 impl<R: Resolve> CachedResolver<R, cache_storer::JsonStorer> {
@@ -271,6 +272,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
     fn poll_ongoing_resolutions(&mut self) -> Async<()> {
         // Process all ongoing DNS resolutions
         let mut finished_resolutions = HashMap::new();
+        let mut cache_changed = false;
         let now = Instant::now();
         for (name, (resolve_future, _listeners)) in &mut self.ongoing_resolutions {
             match resolve_future.poll() {
@@ -283,6 +285,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
                         timestamp: Some(now),
                     };
                     self.cache.insert(name.clone(), cache_entry);
+                    cache_changed = true;
                 }
                 Err(timer_error) => {
                     log::error!("Unable to resolve \"{}\": {}", name, timer_error);
@@ -291,8 +294,8 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
                 }
             }
         }
-        if !finished_resolutions.is_empty() {
-            self.persist_cache();
+        if cache_changed {
+            self.store_cache();
         }
         for (name, result) in finished_resolutions {
             let (_resolve_future, listeners) = self.ongoing_resolutions.remove(&name).unwrap();
@@ -312,15 +315,35 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
         }
     }
 
-    fn persist_cache(&mut self) {
+    fn store_cache(&mut self) {
         if let Some(cache_storer) = &mut self.cache_storer {
             let mut cache = HashMap::with_capacity(self.cache.len());
             for (name, cache_entry) in &self.cache {
                 cache.insert(name.clone(), cache_entry.addrs.clone());
             }
-            if let Err(e) = cache_storer.store(cache) {
-                log_error("Failed to persist cache", &e);
+            // Create the store future and save it. Possibly overwriting
+            // an existing `ongoing_store`. Hopefully dropping that mid-store
+            // should work fine.
+            self.ongoing_store = Some(cache_storer.store(cache));
+        }
+    }
+
+    fn poll_ongoing_store(&mut self) -> Async<()> {
+        if let Some(ongoing_store) = &mut self.ongoing_store {
+            match ongoing_store.poll() {
+                Ok(Async::NotReady) => Async::NotReady,
+                Ok(Async::Ready(())) => {
+                    self.ongoing_store = None;
+                    Async::Ready(())
+                }
+                Err(e) => {
+                    log_error("Failed to store cache", &e);
+                    self.ongoing_store = None;
+                    Async::Ready(())
+                }
             }
+        } else {
+            Async::Ready(())
         }
     }
 }
@@ -343,8 +366,12 @@ impl<R: Resolve, C: CacheStorer> Future for CachedResolver<R, C> {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let handle_rx = self.poll_handles();
         let ongoing_resolutions = self.poll_ongoing_resolutions();
+        let store = self.poll_ongoing_store();
 
-        if handle_rx == Async::Ready(()) && ongoing_resolutions == Async::Ready(()) {
+        if handle_rx == Async::Ready(())
+            && ongoing_resolutions == Async::Ready(())
+            && store == Async::Ready(())
+        {
             log::debug!("All handles closed, shutting down CachedResolver");
             Ok(Async::Ready(()))
         } else {
