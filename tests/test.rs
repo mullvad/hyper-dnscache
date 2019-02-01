@@ -94,7 +94,7 @@ struct MockStoreError;
 #[test]
 fn no_cache_failing_resolver() {
     let (resolver, _) = MockResolver::new(HashMap::new());
-    let (cached_resolver, handle) = CachedResolver::builder(resolver).build().unwrap();
+    let (cached_resolver, handle) = CachedResolver::builder(resolver).build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -115,10 +115,7 @@ fn with_cache_failing_resolver() {
 
     let (resolver, _) = MockResolver::new(HashMap::new());
 
-    let (cached_resolver, handle) = CachedResolver::builder(resolver)
-        .cache(cache)
-        .build()
-        .unwrap();
+    let (cached_resolver, handle) = CachedResolver::builder(resolver).cache(cache).build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -151,7 +148,7 @@ fn no_cache_working_resolver() {
 
     let (resolver, _) = MockResolver::new(domains);
 
-    let (cached_resolver, handle) = CachedResolver::builder(resolver).build().unwrap();
+    let (cached_resolver, handle) = CachedResolver::builder(resolver).build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -169,10 +166,7 @@ fn prefer_cache_over_resolver() {
     let cache = test_cache(&[("cached.net", &[Ipv6Addr::LOCALHOST.into()])]);
 
     let (resolver, _) = MockResolver::new(resolver_domains);
-    let (cached_resolver, handle) = CachedResolver::builder(resolver)
-        .cache(cache)
-        .build()
-        .unwrap();
+    let (cached_resolver, handle) = CachedResolver::builder(resolver).cache(cache).build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -188,8 +182,7 @@ fn prefer_cache_over_resolver() {
 fn timeout_slow_resolver() {
     let (cached_resolver, handle) = CachedResolver::builder(SlowMockResolver)
         .timeout(Duration::from_millis(1000))
-        .build()
-        .unwrap();
+        .build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -208,8 +201,7 @@ fn slow_resolver_uses_cache_or_empty_result() {
     let (cached_resolver, handle) = CachedResolver::builder(SlowMockResolver)
         .timeout(Duration::from_millis(100))
         .cache(cache)
-        .build()
-        .unwrap();
+        .build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -241,8 +233,7 @@ fn cache_expiry_causes_resolve() {
     let (cached_resolver, handle) = CachedResolver::builder(resolver)
         .cache(cache)
         .cache_expiry(Duration::from_millis(100))
-        .build()
-        .unwrap();
+        .build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -282,8 +273,7 @@ fn loads_disk_cache() {
 
     let (cached_resolver, handle) = CachedResolver::builder(resolver)
         .cache_storer(cache_storer)
-        .build()
-        .unwrap();
+        .build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -303,8 +293,7 @@ fn stores_disk_cache() {
 
     let (cached_resolver, handle) = CachedResolver::builder(resolver)
         .cache_storer(cache_storer)
-        .build()
-        .unwrap();
+        .build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);

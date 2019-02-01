@@ -139,19 +139,23 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
     ///
     /// [`cache_file`]: #method.cache_file
     /// [`cache_storer`]: #method.cache_storer
-    pub fn build(mut self) -> Result<(CachedResolver<R, C>, ResolverHandle), C::Error> {
+    pub fn build(mut self) -> (CachedResolver<R, C>, ResolverHandle) {
         // Start out with the provided in-memory cache, or an empty one.
         let mut cache = self.cache.unwrap_or_default();
         if let Some(cache_storer) = &mut self.cache_storer {
-            let loaded_cache = cache_storer.load()?;
-            for (name, addrs) in loaded_cache {
-                cache.insert(
-                    name,
-                    CacheEntry {
-                        addrs,
-                        timestamp: None,
-                    },
-                );
+            match cache_storer.load() {
+                Ok(loaded_cache) => {
+                    for (name, addrs) in loaded_cache {
+                        cache.insert(
+                            name,
+                            CacheEntry {
+                                addrs,
+                                timestamp: None,
+                            },
+                        );
+                    }
+                }
+                Err(e) => log_error(log::Level::Info, &e),
             }
         }
         debug!(
@@ -173,7 +177,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
         let handle = ResolverHandle {
             resolver: handles_tx,
         };
-        Ok((cached_resolver, handle))
+        (cached_resolver, handle)
     }
 }
 
@@ -337,7 +341,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
                     Async::Ready(())
                 }
                 Err(e) => {
-                    log_error("Failed to store cache", &e);
+                    log_error(log::Level::Error, &e);
                     self.ongoing_store = None;
                     Async::Ready(())
                 }
@@ -348,15 +352,15 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
     }
 }
 
-fn log_error(msg: &str, error: &impl std::error::Error) {
-    let mut buffer = format!("Error: {}", msg);
-    let mut source: Option<&dyn std::error::Error> = Some(error);
+fn log_error(level: log::Level, error: &impl std::error::Error) {
+    let mut buffer = format!("Error: {}", error);
+    let mut source: Option<&dyn std::error::Error> = error.source();
     while let Some(error) = source {
         buffer.push_str("\nCaused by: ");
         buffer.push_str(&error.to_string());
         source = error.source();
     }
-    log::error!("{}", buffer);
+    log::log!(level, "{}", buffer);
 }
 
 impl<R: Resolve, C: CacheStorer> Future for CachedResolver<R, C> {
