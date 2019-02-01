@@ -1,5 +1,5 @@
 use hyper::client::connect::dns::{GaiResolver, Name, Resolve};
-use hyper_dnscache::*;
+use hyper_dnscache::CachedResolver;
 use std::{env, str::FromStr};
 
 
@@ -16,7 +16,7 @@ fn main() {
     if let Some(cache_file) = cache_file {
         cached_resolver_builder = cached_resolver_builder.cache_file(cache_file);
     }
-    let (cached_resolver, handle) = unwrap_log(cached_resolver_builder.build());
+    let (cached_resolver, handle) = cached_resolver_builder.build();
 
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.spawn(cached_resolver);
@@ -33,25 +33,4 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-fn unwrap_log<T, E: std::error::Error>(result: Result<T, E>) -> T {
-    match result {
-        Ok(t) => t,
-        Err(e) => {
-            log_error(&e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn log_error(error: &impl std::error::Error) {
-    let mut buffer = format!("Error: {}", error);
-    let mut source: Option<&dyn std::error::Error> = error.source();
-    while let Some(error) = source {
-        buffer.push_str("\nCaused by: ");
-        buffer.push_str(&error.to_string());
-        source = error.source();
-    }
-    log::error!("{}", buffer);
 }
