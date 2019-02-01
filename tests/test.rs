@@ -1,4 +1,4 @@
-use futures::future;
+use futures::{future, Future};
 use hyper::client::connect::dns::{Name, Resolve};
 use hyper_dnscache::*;
 use std::{
@@ -72,18 +72,23 @@ impl MockStorer {
 }
 
 impl CacheStorer for MockStorer {
-    type Error = io::Error;
+    type Error = MockStoreError;
+    type StoreFuture = Box<dyn Future<Item = (), Error = Self::Error> + Send>;
 
     fn load(&mut self) -> Result<HashMap<Name, Vec<IpAddr>>, Self::Error> {
         Ok(dbg!(self.cache.clone()))
     }
 
-    fn store(&mut self, cache: HashMap<Name, Vec<IpAddr>>) -> Result<(), Self::Error> {
+    fn store(&mut self, cache: HashMap<Name, Vec<IpAddr>>) -> Self::StoreFuture {
         let _ = self.stores.send(cache.clone());
         self.cache = dbg!(cache);
-        Ok(())
+        Box::new(future::ok(()))
     }
 }
+
+#[derive(Debug, err_derive::Error)]
+#[error(display = "Mock store failed")]
+struct MockStoreError;
 
 
 #[test]
