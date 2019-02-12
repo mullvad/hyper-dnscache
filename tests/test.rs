@@ -311,6 +311,28 @@ fn stores_disk_cache() {
     );
 }
 
+#[test]
+fn uses_cache_merge_function() {
+    let resolver_domains = test_cache(&[("example.com", &[Ipv4Addr::new(10, 9, 8, 7).into()])]);
+
+    let (resolver, _) = MockResolver::new(resolver_domains);
+    let (cached_resolver, handle) = CachedResolver::builder(resolver)
+        .cache_merge(stupid_cache_merge)
+        .build();
+
+    let mut runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.spawn(cached_resolver);
+
+    let result = runtime
+        .block_on(handle.resolve(name("example.com")))
+        .unwrap();
+    let expected: &[IpAddr] = &[Ipv4Addr::LOCALHOST.into()];
+    assert_eq!(result.as_slice(), expected);
+}
+
+fn stupid_cache_merge(_cached_addrs: &[IpAddr], _new_addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    vec![Ipv4Addr::LOCALHOST.into()]
+}
 
 fn name(name: &str) -> Name {
     Name::from_str(name).unwrap()

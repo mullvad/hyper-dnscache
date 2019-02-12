@@ -15,7 +15,6 @@ use std::{
 };
 
 // TODO:
-// * Optional filtering of results from underlying resolver.
 // * Limit the size of the in-memory cache. Use an LRU cache or similar.
 
 
@@ -38,6 +37,7 @@ pub struct CachedResolverBuilder<R: Resolve, C: CacheStorer = cache_storer::Json
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: Option<HashMap<Name, CacheEntry>>,
+    cache_merge: Option<fn(&[IpAddr], Vec<IpAddr>) -> Vec<IpAddr>>,
     cache_expiry: Option<Duration>,
     cache_storer: Option<C>,
 }
@@ -72,6 +72,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
             resolver,
             resolver_timeout: None,
             cache: None,
+            cache_merge: None,
             cache_expiry: None,
             cache_storer,
         }
@@ -101,6 +102,19 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
         self
     }
 
+    /// Sets what cache merge/update function to use. If this is set then the given function will be
+    /// called after each successful lookup using the underlying resolver. It will be passed the
+    /// current addresses in the cache and the new addresses from the lookup. The addresses returned
+    /// from this function are what will be written to the cache and returned to the resolvers
+    /// waiting for a reply.
+    ///
+    /// If this is not set the default is just to return the second argument. Meaning to use
+    /// whatever addresess the underlying resolver returned.
+    pub fn cache_merge(mut self, cache_merge: fn(&[IpAddr], Vec<IpAddr>) -> Vec<IpAddr>) -> Self {
+        self.cache_merge = Some(cache_merge);
+        self
+    }
+
     /// Changes the [`CacheStorer`] implementation instance for this builder. Allows customizing
     /// how the cache is serialized and stored.
     pub fn cache_storer<C2: CacheStorer>(self, cache_storer: C2) -> CachedResolverBuilder<R, C2> {
@@ -108,6 +122,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
             resolver: self.resolver,
             resolver_timeout: self.resolver_timeout,
             cache: self.cache,
+            cache_merge: self.cache_merge,
             cache_expiry: self.cache_expiry,
             cache_storer: Some(cache_storer),
         }
@@ -168,6 +183,7 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
             resolver: self.resolver,
             resolver_timeout: self.resolver_timeout,
             cache,
+            cache_merge: self.cache_merge.unwrap_or(default_cache_merge),
             cache_expiry: self.cache_expiry,
             cache_storer: self.cache_storer,
             handles_rx: handles_rx.fuse(),
@@ -181,11 +197,16 @@ impl<R: Resolve, C: CacheStorer> CachedResolverBuilder<R, C> {
     }
 }
 
+fn default_cache_merge(_cached_addrs: &[IpAddr], new_addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    new_addrs
+}
+
 
 pub struct CachedResolver<R: Resolve, C: CacheStorer = cache_storer::JsonStorer> {
     resolver: R,
     resolver_timeout: Option<Duration>,
     cache: HashMap<Name, CacheEntry>,
+    cache_merge: fn(&[IpAddr], Vec<IpAddr>) -> Vec<IpAddr>,
     cache_expiry: Option<Duration>,
     cache_storer: Option<C>,
     handles_rx: Fuse<mpsc::Receiver<(Name, oneshot::Sender<Result<IntoIter<IpAddr>, io::Error>>)>>,
@@ -282,10 +303,17 @@ impl<R: Resolve, C: CacheStorer> CachedResolver<R, C> {
             match resolve_future.poll() {
                 Ok(Async::NotReady) => (),
                 Ok(Async::Ready(addrs_iter)) => {
+                    let cached_addrs: &[IpAddr] = self
+                        .cache
+                        .get(name)
+                        .map(|entry| entry.addrs.as_slice())
+                        .unwrap_or(&[]);
                     let addrs: Vec<IpAddr> = addrs_iter.collect();
-                    finished_resolutions.insert(name.clone(), Ok(addrs.clone().into_iter()));
+                    let new_cache_addrs = (self.cache_merge)(cached_addrs, addrs);
+                    finished_resolutions
+                        .insert(name.clone(), Ok(new_cache_addrs.clone().into_iter()));
                     let cache_entry = CacheEntry {
-                        addrs,
+                        addrs: new_cache_addrs,
                         timestamp: Some(now),
                     };
                     self.cache.insert(name.clone(), cache_entry);
